@@ -44,7 +44,8 @@ jobs:
 
       - name: Install Python deps
         run: |
-          pip install pyppeteer aiohttp
+          pip install playwright 
+          playwright install chromium
 
       - name: Run Flood
         env:
