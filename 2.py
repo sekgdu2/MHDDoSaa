@@ -135,7 +135,7 @@ class ConnectionPool:
                     new = await asyncio.gather(*coros)
                     self.pool.extend([p for p in new if p is not None])
                     print(f"Replenished: now {len(self.pool)} connections")
-            await asyncio.sleep(5.0)  # Check every 5 seconds
+            await asyncio.sleep(0.5)  # Check every 5 seconds
 
     async def _create_single_conn(self, i):
         try:
