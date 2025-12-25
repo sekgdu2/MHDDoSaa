@@ -75,9 +75,11 @@ class ConnectionPool:
         self.host = host
         self.port = port
         self.config = config
-        self.pool_size = pool_size
+        self.initial_pool_size = pool_size
         self.pool: List[Http3ClientProtocol] = []
+        self._lock = asyncio.Lock()
         self._stack = None
+        self._running = True
 
     async def __aenter__(self):
         self._stack = AsyncExitStack()
@@ -103,23 +105,76 @@ class ConnectionPool:
                 print(f"  Cảnh báo: Kết nối {i + 1} thất bại: {type(e).__name__}")
                 return None
 
-        coros = [create_conn(i) for i in range(self.pool_size)]
+        coros = [create_conn(i) for i in range(self.initial_pool_size)]
         results = await asyncio.gather(*coros)
         self.pool = [p for p in results if p is not None]
         
         if not self.pool:
             raise RuntimeError("Không thể thiết lập bất kỳ kết nối nào!")
         
-        print(f"✓ Đã tạo {len(self.pool)}/{self.pool_size} kết nối thành công")
+        print(f"✓ Đã tạo {len(self.pool)}/{self.initial_pool_size} kết nối thành công")
+
+        self._maintainer_task = asyncio.create_task(self._maintainer())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._running = False
+        if self._maintainer_task:
+            self._maintainer_task.cancel()
         if self._stack:
             await self._stack.__aexit__(exc_type, exc_val, exc_tb)
 
-    def get_connection(self) -> Http3ClientProtocol:
+    async def _maintainer(self):
+        while self._running:
+            async with self._lock:
+                current = len(self.pool)
+                if current < self.initial_pool_size:
+                    print(f"Pool low: {current}/{self.initial_pool_size}, replenishing...")
+                    to_create = self.initial_pool_size - current
+                    coros = [self._create_single_conn(current + i) for i in range(to_create)]
+                    new = await asyncio.gather(*coros)
+                    self.pool.extend([p for p in new if p is not None])
+                    print(f"Replenished: now {len(self.pool)} connections")
+            await asyncio.sleep(5.0)  # Check every 5 seconds
+
+    async def _create_single_conn(self, i):
+        try:
+            cm = connect(
+                self.host,
+                self.port,
+                configuration=self.config,
+                create_protocol=Http3ClientProtocol,
+                wait_connected=True
+            )
+            protocol = await asyncio.wait_for(
+                self._stack.enter_async_context(cm),
+                timeout=10.0
+            )
+            return protocol
+        except asyncio.TimeoutError:
+            print(f"  Cảnh báo: Kết nối bổ sung {i + 1} timeout, bỏ qua...")
+            return None
+        except Exception as e:
+            print(f"  Cảnh báo: Kết nối bổ sung {i + 1} thất bại: {type(e).__name__}")
+            return None
+
+    async def get_connection(self) -> Http3ClientProtocol:
         """Get a random connection from the pool."""
-        return random.choice(self.pool) if self.pool else None
+        async with self._lock:
+            if not self.pool:
+                raise RuntimeError("No connections available in pool")
+            return random.choice(self.pool)
+
+    async def remove_connection(self, protocol: Http3ClientProtocol):
+        """Remove a bad connection from the pool."""
+        async with self._lock:
+            if protocol in self.pool:
+                self.pool.remove(protocol)
+                try:
+                    protocol.close()
+                except:
+                    pass
+                print(f"Removed bad connection. Pool size now: {len(self.pool)}")
 
 class AtomicCounter:
     """Thread-safe counter for high-frequency increments."""
@@ -142,16 +197,25 @@ async def worker(
     duration: float,
     counter: AtomicCounter,
     stats: dict,
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
+    interval: float
 ):
-    """Worker that sends requests using a connection from the pool."""
+    """Worker that sends requests using a connection from the pool with pacing."""
     end_time = time.perf_counter() + duration
     request_count = 0
     error_count = 0
+    next_send = time.perf_counter()
 
-    while time.perf_counter() < end_time:
+    while next_send < end_time:
         async with semaphore:
-            conn = pool.get_connection()
+            try:
+                conn = await pool.get_connection()
+            except Exception as e:
+                print(f"Worker {worker_id} failed to get connection: {type(e).__name__}")
+                error_count += 1
+                await asyncio.sleep(0.1)  # Brief backoff
+                continue
+
             try:
                 start_req = time.perf_counter()
                 resp = await conn.send_request(headers, timeout=5.0)
@@ -163,11 +227,21 @@ async def worker(
                 if resp.headers and any(k == b':status' and v == b'200' for k, v in resp.headers):
                     pass  # success
                 else:
-                    error_count += 1
+                    raise ValueError("Non-200 status")
             except Exception as e:
                 error_count += 1
                 if error_count % 100 == 1:
                     print(f"Worker {worker_id} error (count={error_count}): {type(e).__name__}")
+                # Remove bad connection on error
+                await pool.remove_connection(conn)
+            finally:
+                # Pace to next send time regardless of success/failure
+                next_send += interval
+                delay = next_send - time.perf_counter()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                elif delay < -interval * 2:  # If too far behind, reset
+                    next_send = time.perf_counter() + interval
 
     async with stats['_lock']:
         stats['total_requests'] = stats.get('total_requests', 0) + request_count
@@ -245,10 +319,14 @@ async def main():
 
         semaphore = asyncio.Semaphore(args.max_concurrency)
 
+        # Calculate per-worker interval for pacing
+        per_worker_rps = args.rps / args.workers if args.workers > 0 else args.rps
+        interval = 1.0 / per_worker_rps if per_worker_rps > 0 else 0.0
+
         start_time = time.perf_counter()
         tasks = [
             asyncio.create_task(
-                worker(i, pool, headers, args.duration, counter, stats, semaphore),
+                worker(i, pool, headers, args.duration, counter, stats, semaphore, interval),
                 name=f"worker-{i}"
             )
             for i in range(args.workers)
@@ -265,7 +343,7 @@ async def main():
                 if elapsed > 0:
                     current_rps = (current_count - last_count) / elapsed
                     print(f"Progress: {current_count} req | Current RPS: {current_rps:.1f} | "
-                          f"Errors: {stats.get('total_errors', 0)}")
+                          f"Errors: {stats.get('total_errors', 0)} | Pool size: {len(pool.pool)}")
                 last_count = current_count
                 last_time = current_time
 
